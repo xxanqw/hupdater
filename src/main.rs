@@ -93,6 +93,17 @@ fn is_installed_via_winget() -> bool {
     }
 }
 
+fn get_system_architecture() -> &'static str {
+    let arch = env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default();
+    let arch_w6432 = env::var("PROCESSOR_ARCHITEW6432").unwrap_or_default();
+
+    if arch.eq_ignore_ascii_case("ARM64") || arch_w6432.eq_ignore_ascii_case("ARM64") {
+        "arm64"
+    } else {
+        "x64"
+    }
+}
+
 fn scan_registry_for_helium() -> (bool, Option<String>) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -276,11 +287,7 @@ async fn perform_github_update() -> Result<()> {
         .await?
         .json()
         .await?;
-    let arch = match env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        _ => "x64",
-    };
+    let arch = get_system_architecture();
     let asset_name_part = format!("_{}-installer.exe", arch);
     let asset = release
         .assets
@@ -727,18 +734,15 @@ async fn handle_silent_launch() -> Result<()> {
             let latest = rel.tag_name.trim_start_matches('v');
             if let Some(inst) = installed {
                 if inst != latest {
-                    let arch = match env::consts::ARCH {
-                        "x86_64" => "x64",
-                        "aarch64" => "arm64",
-                        _ => "x64",
-                    };
+                    let arch = get_system_architecture();
                     let part = format!("_{}-installer.exe", arch);
                     if let Some(a) = rel.assets.iter().find(|x| x.name.contains(&part)) {
                         let url = a.browser_download_url.clone();
+                        let asset_name = a.name.clone();
                         tokio::spawn(async move {
                             if let Ok(r) = reqwest::get(&url).await {
                                 if let Ok(b) = r.bytes().await {
-                                    let t = env::temp_dir().join("helium_update.exe");
+                                    let t = env::temp_dir().join(&asset_name);
                                     if tokio::fs::write(&t, &b).await.is_ok() {
                                         if let Ok(status) = Command::new(&t)
                                             .creation_flags(CREATE_NO_WINDOW_FLAG)

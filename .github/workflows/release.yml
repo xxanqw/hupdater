@@ -17,17 +17,29 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Release
-        run: cargo build --release
+      - name: Build Release (x64)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build Release (ARM64)
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      - name: Prepare Binaries
+        shell: pwsh
+        run: |
+          mv target/aarch64-pc-windows-msvc/release/hupdater.exe target/aarch64-pc-windows-msvc/release/hupdater-arm64.exe
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/hupdater.exe
+          files: |
+            target/x86_64-pc-windows-msvc/release/hupdater.exe
+            target/aarch64-pc-windows-msvc/release/hupdater-arm64.exe
           generate_release_notes: true
           draft: false
           prerelease: false
