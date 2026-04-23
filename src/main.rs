@@ -1,11 +1,10 @@
 #![windows_subsystem = "windows"]
 
-slint::include_modules!();
+mod ui;
 
 use anyhow::{Context, Result, anyhow};
 use mslnk::ShellLink;
 use serde::{Deserialize, Serialize};
-use slint::ComponentHandle;
 use std::env;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
@@ -24,7 +23,7 @@ use windows::Win32::UI::Shell::{
     SetCurrentProcessExplicitAppUserModelID, ShellLink as CLSID_ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, IDYES,
 };
 use windows::core::{ComInterface, PCWSTR, PWSTR};
 use winreg::RegKey;
@@ -104,7 +103,13 @@ fn get_system_architecture() -> &'static str {
     }
 }
 
-fn scan_registry_for_helium() -> (bool, Option<String>) {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InstallScope {
+    User,
+    System,
+}
+
+fn scan_registry_for_helium() -> (bool, Option<String>, Option<InstallScope>) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let exact_paths = [
@@ -117,7 +122,7 @@ fn scan_registry_for_helium() -> (bool, Option<String>) {
     ];
 
     // 1. Try exact paths first (fastest)
-    for hive in &[&hkcu, &hklm] {
+    for (hive, scope) in [(&hkcu, InstallScope::User), (&hklm, InstallScope::System)] {
         for path in &exact_paths {
             if let Ok(key) = hive.open_subkey(path) {
                 let version: String = key.get_value("DisplayVersion").unwrap_or_default();
@@ -129,13 +134,14 @@ fn scan_registry_for_helium() -> (bool, Option<String>) {
                     } else {
                         Some(normalized)
                     },
+                    Some(scope),
                 );
             }
         }
     }
 
     // 2. Scan all uninstall entries (slower)
-    for hive in &[&hkcu, &hklm] {
+    for (hive, scope) in [(&hkcu, InstallScope::User), (&hklm, InstallScope::System)] {
         for base_path in &base_paths {
             if let Ok(uninstall_key) = hive.open_subkey(base_path) {
                 for name in uninstall_key.enum_keys().filter_map(|x| x.ok()) {
@@ -155,6 +161,7 @@ fn scan_registry_for_helium() -> (bool, Option<String>) {
                                 } else {
                                     Some(normalized)
                                 },
+                                Some(scope),
                             );
                         }
                     }
@@ -163,15 +170,11 @@ fn scan_registry_for_helium() -> (bool, Option<String>) {
         }
     }
 
-    (false, None)
-}
-
-fn check_registry_installed() -> bool {
-    scan_registry_for_helium().0
+    (false, None, None)
 }
 
 fn get_installed_version() -> Option<String> {
-    let (installed, version) = scan_registry_for_helium();
+    let (installed, version, _) = scan_registry_for_helium();
     if version.is_some() {
         return version;
     }
@@ -237,6 +240,17 @@ fn normalize_version_label(version: &str) -> String {
         .trim_start_matches(|c| c == 'v' || c == 'V')
         .trim()
         .to_string()
+}
+
+fn version_greater_than(a: &str, b: &str) -> bool {
+    let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+    let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+    for (a, b) in a_parts.iter().zip(b_parts.iter()) {
+        if a != b {
+            return a > b;
+        }
+    }
+    a_parts.len() > b_parts.len()
 }
 
 async fn perform_winget_update() -> Result<()> {
@@ -342,29 +356,73 @@ fn get_helium_exe_path() -> PathBuf {
         }
     }
     let lap = env::var("LOCALAPPDATA").unwrap_or_default();
-    Path::new(&lap).join(r"imput\Helium\Application\chrome.exe")
+    let p = Path::new(&lap).join(r"imput\Helium\Application\chrome.exe");
+    if p.exists() {
+        return p;
+    }
+
+    let pf = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let p = Path::new(&pf).join(r"imput\Helium\Application\chrome.exe");
+    if p.exists() {
+        return p;
+    }
+
+    p
 }
 
 fn get_shortcut_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    // Desktop & Start Menu
+    // 0: User Desktop
     if let Ok(d) = env::var("USERPROFILE") {
         v.push(Path::new(&d).join("Desktop").join("Helium.lnk"));
+    } else {
+        v.push(PathBuf::new());
     }
+    
+    // 1: Public Desktop
     if let Ok(p) = env::var("PUBLIC") {
         v.push(Path::new(&p).join("Desktop").join("Helium.lnk"));
+    } else {
+        v.push(PathBuf::new());
     }
+
+    // 2: User Start Menu
     if let Ok(a) = env::var("APPDATA") {
-        v.push(Path::new(&a).join(r"Microsoft\Windows\Start Menu\Programs\Helium.lnk"));
-        // Taskbar Pinned Icons
+        let base = Path::new(&a).join(r"Microsoft\Windows\Start Menu\Programs");
+        let p1 = base.join("Helium.lnk");
+        let p2 = base.join("Helium").join("Helium.lnk");
+        if p2.exists() {
+            v.push(p2);
+        } else {
+            v.push(p1);
+        }
+    } else {
+        v.push(PathBuf::new());
+    }
+
+    // 3: Public Start Menu
+    if let Ok(pd) = env::var("PROGRAMDATA") {
+        let base = Path::new(&pd).join(r"Microsoft\Windows\Start Menu\Programs");
+        let p1 = base.join("Helium.lnk");
+        let p2 = base.join("Helium").join("Helium.lnk");
+        if p2.exists() {
+            v.push(p2);
+        } else {
+            v.push(p1);
+        }
+    } else {
+        v.push(PathBuf::new());
+    }
+
+    // 4: Taskbar Pinned Icons
+    if let Ok(a) = env::var("APPDATA") {
         v.push(
             Path::new(&a)
                 .join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Helium.lnk"),
         );
-    }
-    if let Ok(pd) = env::var("PROGRAMDATA") {
-        v.push(Path::new(&pd).join(r"Microsoft\Windows\Start Menu\Programs\Helium.lnk"));
+    } else {
+        v.push(PathBuf::new());
     }
 
     v
@@ -574,7 +632,7 @@ async fn setup_interceptor() -> Result<()> {
         .filter(|p| p.exists())
         .collect();
     if shortcut_paths.is_empty() {
-        return Err(anyhow!("No Helium shortcuts were found to update."));
+        return Ok(());
     }
 
     let mut backups = Vec::new();
@@ -679,7 +737,7 @@ async fn check_hupdater_updates() {
     let latest = normalize_version_label(&release.tag_name);
     let current = env!("CARGO_PKG_VERSION");
 
-    if !latest.is_empty() && latest != current {
+    if !latest.is_empty() && version_greater_than(&latest, current) {
         let msg = format!(
             "A new version of HUpdater (v{}) is available! Current version is v{}.\n\nWould you like to open the download page?",
             latest, current
@@ -721,8 +779,22 @@ async fn handle_silent_launch() -> Result<()> {
     let wd = h_exe.parent().unwrap_or(Path::new("."));
     let args: Vec<String> = env::args().skip(2).collect();
     let installed = get_installed_version();
+
+    if h_exe.exists() {
+        Command::new(&h_exe)
+            .creation_flags(CREATE_NO_WINDOW_FLAG)
+            .args(args)
+            .current_dir(wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+    } else {
+        return Err(anyhow!("Helium executable not found at {:?}", h_exe));
+    }
+
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
         .user_agent("hupdater")
         .build()?;
     if let Ok(resp) = client
@@ -739,43 +811,31 @@ async fn handle_silent_launch() -> Result<()> {
                     if let Some(a) = rel.assets.iter().find(|x| x.name.contains(&part)) {
                         let url = a.browser_download_url.clone();
                         let asset_name = a.name.clone();
-                        tokio::spawn(async move {
-                            if let Ok(r) = reqwest::get(&url).await {
-                                if let Ok(b) = r.bytes().await {
-                                    let t = env::temp_dir().join(&asset_name);
-                                    if tokio::fs::write(&t, &b).await.is_ok() {
-                                        if let Ok(status) = Command::new(&t)
-                                            .creation_flags(CREATE_NO_WINDOW_FLAG)
-                                            .arg("/S")
-                                            .stdin(std::process::Stdio::null())
-                                            .stdout(std::process::Stdio::null())
-                                            .stderr(std::process::Stdio::null())
-                                            .status()
-                                        {
-                                            if status.success() {
-                                                show_update_success_notification(
-                                                    "Helium was updated successfully in the background.",
-                                                );
-                                            }
+                        if let Ok(r) = reqwest::get(&url).await {
+                            if let Ok(b) = r.bytes().await {
+                                let t = env::temp_dir().join(&asset_name);
+                                if tokio::fs::write(&t, &b).await.is_ok() {
+                                    if let Ok(status) = Command::new(&t)
+                                        .creation_flags(CREATE_NO_WINDOW_FLAG)
+                                        .arg("/S")
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()
+                                    {
+                                        if status.success() {
+                                            show_update_success_notification(
+                                                "Helium was updated successfully in the background.",
+                                            );
                                         }
                                     }
                                 }
                             }
-                        });
+                        }
                     }
                 }
             }
         }
-    }
-    if h_exe.exists() {
-        Command::new(&h_exe)
-            .creation_flags(CREATE_NO_WINDOW_FLAG)
-            .args(args)
-            .current_dir(wd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
     }
     Ok(())
 }
@@ -922,19 +982,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ui = AppWindow::new()?;
     let config: AppConfig = confy::load("hupdater", None).unwrap_or_default();
+    let config_lock = Arc::new(Mutex::new(config.clone()));
 
-    // Set initial UI state
-    ui.set_use_winget(config.update_method == UpdateMethod::Winget);
-    ui.set_interceptor_enabled(config.interceptor_enabled);
-    ui.set_controls_enabled(false);
-    ui.set_task_info("Checking Helium installation...".into());
+    let mut initial_state = ui::UiState::default();
+    initial_state.use_winget = config.update_method == UpdateMethod::Winget;
+    initial_state.interceptor_enabled = config.interceptor_enabled;
+    initial_state.controls_enabled = false;
+    initial_state.task_info = "Checking Helium installation...".to_string();
 
     // Status Check (Async)
-    let ui_handle = ui.as_weak();
     tokio::spawn(async move {
-        let reg = check_registry_installed();
+        let (reg, installed_version_raw, scope) = scan_registry_for_helium();
         let winget = if check_winget_installed() {
             is_installed_via_winget()
         } else {
@@ -950,7 +1009,7 @@ async fn main() -> Result<()> {
             "Not detected"
         };
 
-        let installed_version = get_installed_version()
+        let installed_version = installed_version_raw
             .map(|v| normalize_version_label(&v))
             .filter(|v| !v.is_empty());
         let latest_version = if reg || winget {
@@ -975,20 +1034,21 @@ async fn main() -> Result<()> {
             base_status.to_string()
         };
 
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui_handle.upgrade() {
-                ui.set_install_status(status.into());
-                ui.set_controls_enabled(true);
-                ui.set_task_info("Ready".into());
-            }
-        });
+        let helium_installed = reg || winget;
+        ui::events::post_ui_event(ui::events::UiEvent::SetInstallStatus(status));
+        ui::events::post_ui_event(ui::events::UiEvent::SetHeliumInstalled(helium_installed));
+        ui::events::post_ui_event(ui::events::UiEvent::SetControlsEnabled(true));
+        ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo("Ready".to_string()));
+        if let Some(s) = scope {
+            ui::events::post_ui_event(ui::events::UiEvent::SetInstallScope(
+                if s == InstallScope::System { "system" } else { "user" }.to_string(),
+            ));
+        }
     });
 
     // Callbacks
-    let config_lock = Arc::new(Mutex::new(config));
-
     let c_lock = config_lock.clone();
-    ui.on_save_settings(move |use_winget| {
+    let on_save_settings: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(move |use_winget| {
         let mut config = c_lock.lock().unwrap();
         config.update_method = if use_winget {
             UpdateMethod::Winget
@@ -998,125 +1058,109 @@ async fn main() -> Result<()> {
         let _ = confy::store("hupdater", None, &*config);
     });
 
-    let ui_handle = ui.as_weak();
     let interceptor_lock = config_lock.clone();
-    ui.on_enable_interceptor(move || {
-        let ui = ui_handle.upgrade().unwrap();
-        ui.set_is_busy(true);
+    let on_enable_interceptor: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let interceptor_lock = interceptor_lock.clone();
-        let ui_handle = ui_handle.clone();
         tokio::spawn(async move {
             let res = setup_interceptor().await;
             let explorer_res = if res.is_ok() { restart_explorer_shell() } else { Ok(()) };
 
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_handle.upgrade() {
-                    match res {
-                        Ok(_) => {
-                            ui.set_interceptor_enabled(true);
-                            {
-                                let mut config = interceptor_lock.lock().unwrap();
-                                config.interceptor_enabled = true;
-                                let _ = confy::store("hupdater", None, &*config);
-                            }
-
-                            match explorer_res {
-                                Ok(_) => ui.set_task_info("Interceptor enabled. Explorer restarted.".into()),
-                                Err(e) => ui.set_task_info(
-                                    format!(
-                                        "Interceptor enabled, but Explorer restart failed: {}. Please restart Explorer manually.",
-                                        e
-                                    )
-                                    .into(),
-                                ),
-                            }
-                        }
-                        Err(e) => {
-                            ui.set_task_info("Interceptor setup failed. See notification for fixes.".into());
-                            show_interceptor_setup_failure_notification(&e);
-                        }
+            match res {
+                Ok(_) => {
+                    ui::events::post_ui_event(ui::events::UiEvent::SetInterceptorEnabled(true));
+                    {
+                        let mut config = interceptor_lock.lock().unwrap();
+                        config.interceptor_enabled = true;
+                        let _ = confy::store("hupdater", None, &*config);
                     }
-                    ui.set_is_busy(false);
+
+                    match explorer_res {
+                        Ok(_) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                            "Interceptor enabled. Explorer restarted.".to_string(),
+                        )),
+                        Err(e) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                            format!("Interceptor enabled, but Explorer restart failed: {}. Please restart Explorer manually.", e),
+                        )),
+                    }
                 }
-            });
+                Err(e) => {
+                    ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                        "Interceptor setup failed. See notification for fixes.".to_string(),
+                    ));
+                    show_interceptor_setup_failure_notification(&e);
+                }
+            }
+            ui::events::post_ui_event(ui::events::UiEvent::SetIsBusy(false));
         });
     });
 
-    let ui_handle = ui.as_weak();
     let interceptor_lock = config_lock.clone();
-    ui.on_restore_interceptor(move || {
-        let ui = ui_handle.upgrade().unwrap();
-        ui.set_is_busy(true);
+    let on_restore_interceptor: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let interceptor_lock = interceptor_lock.clone();
-        let ui_handle = ui_handle.clone();
         tokio::spawn(async move {
             let res = remove_interceptor().await;
             let explorer_res = if res.is_ok() { restart_explorer_shell() } else { Ok(()) };
 
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_handle.upgrade() {
-                    match res {
-                        Ok(_) => {
-                            ui.set_interceptor_enabled(false);
-                            {
-                                let mut config = interceptor_lock.lock().unwrap();
-                                config.interceptor_enabled = false;
-                                let _ = confy::store("hupdater", None, &*config);
-                            }
-
-                            match explorer_res {
-                                Ok(_) => ui.set_task_info("Restored original shortcuts. Explorer restarted.".into()),
-                                Err(e) => ui.set_task_info(
-                                    format!(
-                                        "Restored original shortcuts, but Explorer restart failed: {}. Please restart Explorer manually.",
-                                        e
-                                    )
-                                    .into(),
-                                ),
-                            }
-                        }
-                        Err(e) => ui.set_task_info(format!("Error: {}", e).into()),
+            match res {
+                Ok(_) => {
+                    ui::events::post_ui_event(ui::events::UiEvent::SetInterceptorEnabled(false));
+                    {
+                        let mut config = interceptor_lock.lock().unwrap();
+                        config.interceptor_enabled = false;
+                        let _ = confy::store("hupdater", None, &*config);
                     }
-                    ui.set_is_busy(false);
+
+                    match explorer_res {
+                        Ok(_) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                            "Restored original shortcuts. Explorer restarted.".to_string(),
+                        )),
+                        Err(e) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                            format!("Restored original shortcuts, but Explorer restart failed: {}. Please restart Explorer manually.", e),
+                        )),
+                    }
                 }
-            });
+                Err(e) => {
+                    ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(format!("Error: {}", e)));
+                }
+            }
+            ui::events::post_ui_event(ui::events::UiEvent::SetIsBusy(false));
         });
     });
 
-    ui.on_uninstall_updater(move || {
+    let on_uninstall_updater: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         tokio::spawn(async move {
             let _ = uninstall_self().await;
         });
     });
 
-    let ui_handle = ui.as_weak();
     let c_lock = config_lock.clone();
-    ui.on_trigger_update(move || {
-        let ui = ui_handle.upgrade().unwrap();
-        ui.set_is_busy(true);
-        ui.set_task_info("Updating...".into());
-
+    let on_trigger_update: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let method = c_lock.lock().unwrap().update_method.clone();
-        let ui_inner = ui_handle.clone();
-
         tokio::spawn(async move {
             let res = match method {
                 UpdateMethod::Winget => perform_winget_update().await,
                 UpdateMethod::Installer => perform_github_update().await,
             };
 
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_inner.upgrade() {
-                    ui.set_is_busy(false);
-                    match res {
-                        Ok(_) => ui.set_task_info("Update completed successfully.".into()),
-                        Err(e) => ui.set_task_info(format!("Error: {}", e).into()),
-                    }
-                }
-            });
+            ui::events::post_ui_event(ui::events::UiEvent::SetIsBusy(false));
+            match res {
+                Ok(_) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                    "Update completed successfully.".to_string(),
+                )),
+                Err(e) => ui::events::post_ui_event(ui::events::UiEvent::SetTaskInfo(
+                    format!("Error: {}", e),
+                )),
+            }
         });
     });
 
-    ui.run()?;
+    ui::run_app(ui::AppCallbacks {
+        on_trigger_update,
+        on_enable_interceptor,
+        on_restore_interceptor,
+        on_uninstall_updater,
+        on_save_settings,
+    }, initial_state)?;
+
     Ok(())
 }

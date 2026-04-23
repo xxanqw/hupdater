@@ -1,6 +1,6 @@
 [package]
 name = "hupdater"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -11,12 +11,10 @@ winreg = "0.52"
 anyhow = "1.0"
 confy = "0.6"
 mslnk = "0.1"
-slint = "1.9"
-windows = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
+windows = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_Controls"] }
 
 [build-dependencies]
 embed-resource = "1.8"
-slint-build = "1.9"
 
 [profile.release]
 opt-level = "z"
